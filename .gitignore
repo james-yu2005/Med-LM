@@ -8,3 +8,4 @@ build/
 data/input.txt
 tokenizer/bpe.json
 tokenizer/corpus_tokens.pt
+checkpoints/

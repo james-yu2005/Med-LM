@@ -1,5 +1,8 @@
 """GPT trained on byte-level BPE tokens. Run: python -m tokenizer.train  then  python gpt_bpe.py"""
 
+import argparse
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -20,46 +23,10 @@ n_layer = 6
 dropout = 0.2
 # ------------
 
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+DEFAULT_CHECKPOINT = CHECKPOINT_DIR / "gpt_bpe.pt"
+
 torch.manual_seed(1337)
-
-# byte-level BPE tokenizer (train once: python -m tokenizer.train)
-tokenizer = load_tokenizer()
-vocab_size = tokenizer.vocab_size
-encode = tokenizer.encode
-decode = tokenizer.decode
-
-tokens = load_corpus_tokens(tokenizer, CORPUS_MAX_CHARS)
-print(f"Corpus: {CORPUS_MAX_CHARS:,} chars -> {len(tokens):,} BPE tokens")
-
-# Train and test splits
-data = torch.tensor(tokens, dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=block_size, base=10000):
@@ -146,7 +113,7 @@ class Block(nn.Module):
 
 class GPTLanguageModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, vocab_size: int):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.rope = RotaryEmbedding(n_embd // n_head)
@@ -202,31 +169,185 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-model = GPTLanguageModel()
-m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
+def model_config(vocab_size: int) -> dict:
+    return {
+        "vocab_size": vocab_size,
+        "batch_size": batch_size,
+        "block_size": block_size,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_layer": n_layer,
+        "dropout": dropout,
+        "learning_rate": learning_rate,
+        "max_iters": max_iters,
+    }
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+def save_checkpoint(
+    path: Path,
+    step: int,
+    model: GPTLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    vocab_size: int,
+    losses: dict | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": model_config(vocab_size),
+            "losses": losses,
+        },
+        path,
+    )
+    print(f"Saved checkpoint: {path}")
 
-for iter in range(max_iters):
+def load_checkpoint(
+    path: Path,
+    model: GPTLanguageModel,
+    vocab_size: int,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> int:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    saved_config = checkpoint.get("config", {})
+    for key, value in model_config(vocab_size).items():
+        if saved_config.get(key) != value:
+            print(f"Warning: checkpoint {key}={saved_config.get(key)!r} differs from current {value!r}")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    step = checkpoint.get("step", checkpoint.get("iter", 0))
+    print(f"Loaded checkpoint from step {step}: {path}")
+    return step
 
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+def generate_sample(
+    model: GPTLanguageModel,
+    encode,
+    decode,
+    prompt: str = "Diabetes is",
+    max_new_tokens: int = 500,
+) -> str:
+    context = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
+    with torch.no_grad():
+        output = model.generate(context, max_new_tokens=max_new_tokens)
+    return decode(output[0].tolist())
 
-    # sample a batch of data
-    xb, yb = get_batch('train')
+def train(
+    model: GPTLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    train_data: torch.Tensor,
+    val_data: torch.Tensor,
+    checkpoint_path: Path,
+    vocab_size: int,
+    resume: bool = False,
+) -> None:
+    def get_batch(split):
+        data = train_data if split == 'train' else val_data
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([data[i:i+block_size] for i in ix])
+        y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+        x, y = x.to(device), y.to(device)
+        return x, y
 
-    # evaluate the loss
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    @torch.no_grad()
+    def estimate_loss():
+        out = {}
+        model.eval()
+        for split in ['train', 'val']:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = get_batch(split)
+                logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
+        model.train()
+        return out
 
-# generate from the model (prompt with real text for better samples)
-prompt = "Diabetes is"
-context = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    start_step = 0
+    if resume:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"No checkpoint to resume: {checkpoint_path}")
+        start_step = load_checkpoint(checkpoint_path, model, vocab_size, optimizer) + 1
+
+    for step in range(start_step, max_iters):
+
+        # every once in a while evaluate the loss on train and val sets
+        if step % eval_interval == 0 or step == max_iters - 1:
+            losses = estimate_loss()
+            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            save_checkpoint(checkpoint_path, step, model, optimizer, vocab_size, losses)
+
+        # sample a batch of data
+        xb, yb = get_batch('train')
+
+        # evaluate the loss
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train or run a byte-level BPE GPT.")
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help="Load a checkpoint and generate text (skip training).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the checkpoint file.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=DEFAULT_CHECKPOINT,
+        help=f"Checkpoint path (default: {DEFAULT_CHECKPOINT}).",
+    )
+    parser.add_argument(
+        "--prompt",
+        default="Diabetes is",
+        help="Prompt used with --generate.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=500,
+        help="Tokens to generate with --generate.",
+    )
+    args = parser.parse_args()
+
+    tokenizer = load_tokenizer()
+    vocab_size = tokenizer.vocab_size
+    encode = tokenizer.encode
+    decode = tokenizer.decode
+
+    model = GPTLanguageModel(vocab_size).to(device)
+    print(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f} M parameters")
+
+    if args.generate:
+        if not args.checkpoint.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {args.checkpoint}. Train first or download your RunPod checkpoint."
+            )
+        load_checkpoint(args.checkpoint, model, vocab_size)
+        model.eval()
+        print(generate_sample(model, encode, decode, args.prompt, args.max_new_tokens))
+        return
+
+    tokens = load_corpus_tokens(tokenizer, CORPUS_MAX_CHARS)
+    print(f"Corpus: {CORPUS_MAX_CHARS:,} chars -> {len(tokens):,} BPE tokens")
+
+    data = torch.tensor(tokens, dtype=torch.long)
+    n = int(0.9 * len(data))
+    train_data = data[:n]
+    val_data = data[n:]
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    train(model, optimizer, train_data, val_data, args.checkpoint, vocab_size, resume=args.resume)
+    print(generate_sample(model, encode, decode))
+
+
+if __name__ == "__main__":
+    main()
