@@ -7,47 +7,67 @@ A from-scratch language modeling project in PyTorch, inspired by [Karpathy's "Le
 1. **Bigram model** — predicts the next character from only the previous one
 2. **GPT + BPE** — a ~10M-parameter Transformer trained on subword tokens (byte-level BPE, GPT-2 style)
 3. **Custom tokenizer** — BPE trained from scratch on UTF-8 bytes (no HuggingFace tokenizer)
+4. **GPU training pipeline** — train locally or on RunPod / any cloud GPU, with checkpoint saving and a downloadable model bundle
 
 ## Project structure
 
 ```
 transformers/
 ├── data/
-│   └── input.txt          # training corpus (generated, not committed)
+│   ├── load_dataset.py    # download & format medical flashcards
+│   ├── input.txt          # pretrain corpus (generated)
+│   └── instruct.txt       # Q&A corpus for future instruction tuning (generated)
 ├── tokenizer/
 │   ├── bpe_tokenizer.py   # byte-level BPE encode/decode/train
 │   ├── corpus.py          # paths, corpus loading, token cache
 │   ├── train.py           # train tokenizer + encode corpus
 │   ├── bpe.json           # learned merges (generated)
 │   └── corpus_tokens.pt   # pre-encoded training data (generated)
+├── checkpoints/
+│   ├── gpt_bpe.pt         # latest eval snapshot
+│   ├── gpt_bpe_best.pt    # best validation loss (use for generation)
+│   ├── gpt_bpe_final.pt   # final training step
+│   └── model_bundle.zip   # weights + tokenizer for download
+├── scripts/
+│   └── runpod_train.sh    # one-shot training script for cloud GPUs
 ├── bigram.py              # step 1: character bigram baseline
-├── gpt_bpe.py             # step 2: GPT on BPE tokens (main model)
-└── test_encode.py         # interactive tokenizer tester
+├── gpt_bpe.py             # step 2: GPT on BPE tokens (train / generate)
+├── export_bundle.py       # zip checkpoint + tokenizer for backup
+├── test_encode.py         # interactive tokenizer tester
+└── requirements.txt
 ```
 
 ## Requirements
 
 - Python 3.10+
-- PyTorch
-- `datasets` (only for downloading the medical corpus)
+- PyTorch (included on RunPod PyTorch templates; install locally with [pytorch.org](https://pytorch.org))
+- `datasets` (for downloading the medical corpus)
 
 ```powershell
-pip install torch datasets
+pip install -r requirements.txt
 ```
 
-## Quick start
+On RunPod, use a **PyTorch** template — CUDA PyTorch is pre-installed. `requirements.txt` only adds `datasets` and pins `numpy<2`.
+
+## Quick start (local CPU or GPU)
 
 Run everything from the project root (`transformers/`).
 
 ### 1. Get training data
 
-Place your text at `data/input.txt`, or download the medical flashcard dataset:
-
 ```powershell
-python data/load_dataset.py
+python data/load_dataset.py --format pretrain
 ```
 
-This writes ~50k medical explanations to `data/input.txt`.
+This downloads medical flashcards and writes answer-only text to `data/input.txt` (~50k examples).
+
+For Q&A-formatted data (future instruction tuning):
+
+```powershell
+python data/load_dataset.py --format instruct
+```
+
+Writes `data/instruct.txt`. The current GPT trainer uses `input.txt` (pretrain format).
 
 ### 2. Train tokenizer and encode corpus
 
@@ -66,23 +86,98 @@ To re-encode only (tokenizer already exists):
 python -m tokenizer.train --cache-only
 ```
 
-### 3. Test the tokenizer (optional)
+### 3. Train the GPT
 
 ```powershell
-python test_encode.py
-```
-
-### 4. Train models
-
-```powershell
-# Baseline: character bigram
-python bigram.py
-
-# Main model: GPT on BPE tokens (~10M params)
 python gpt_bpe.py
 ```
 
-`gpt_bpe.py` loads cached tokens automatically and generates text from the prompt `"Diabetes is"`.
+- Auto-detects CUDA GPU; falls back to CPU if unavailable
+- Saves checkpoints every 500 steps to `checkpoints/`
+- Keeps the best validation checkpoint as `checkpoints/gpt_bpe_best.pt`
+- Exports `checkpoints/model_bundle.zip` when training finishes
+
+### 4. Generate text from a trained checkpoint
+
+```powershell
+python gpt_bpe.py --generate --prompt "Diabetes is"
+python gpt_bpe.py --generate --checkpoint checkpoints/gpt_bpe_best.pt --prompt "Heart failure is"
+```
+
+Generation only needs `checkpoints/gpt_bpe_best.pt` and `tokenizer/bpe.json`.
+
+### 5. Resume training
+
+```powershell
+python gpt_bpe.py --resume
+```
+
+## Train on RunPod (or any cloud GPU)
+
+### Recommended GPU
+
+| GPU | Notes |
+|-----|-------|
+| **RTX 4090 / 3090** | Best value (~15–25 min training) |
+| **RTX A4000 / T4** | Cheaper, slower |
+
+Any GPU with **≥16 GB VRAM** is more than enough for this ~10M-parameter model.
+
+### Setup
+
+1. Push this repo to GitHub
+2. Deploy a RunPod pod with a **PyTorch** template (Community Cloud is fine)
+3. Add your SSH public key in RunPod settings (optional — Web Terminal works without SSH)
+4. Open **Connect → Web Terminal** (or SSH in)
+
+### One-command training
+
+```bash
+git clone https://github.com/james-yu2005/mini-medical-gpt.git
+cd mini-medical-gpt
+bash scripts/runpod_train.sh
+```
+
+Or step by step:
+
+```bash
+git clone https://github.com/james-yu2005/mini-medical-gpt.git
+cd mini-medical-gpt
+pip install -r requirements.txt
+python data/load_dataset.py --format pretrain
+python -m tokenizer.train
+python gpt_bpe.py
+python export_bundle.py
+```
+
+### Download your model before stopping the pod
+
+RunPod container disk is **ephemeral** — files are deleted when the pod terminates.
+
+Download **`checkpoints/model_bundle.zip`** (contains `gpt_bpe_best.pt` + `bpe.json`):
+
+- **Jupyter Terminal:** `curl -F "file=@checkpoints/model_bundle.zip" https://0x0.st` → open the URL on your PC
+- **Jupyter file browser:** download `model_bundle.zip` from `checkpoints/` (large folders may be slow in the UI)
+- **SCP from your PC:**
+
+```powershell
+scp -P PORT -i $env:USERPROFILE\.ssh\id_ed25519 root@POD_IP:/workspace/mini-medical-gpt/checkpoints/model_bundle.zip .
+```
+
+### Use the model locally
+
+```powershell
+cd C:\Users\james\Desktop\transformers
+Expand-Archive -Path .\model_bundle.zip -DestinationPath . -Force
+python gpt_bpe.py --generate --prompt "Diabetes is"
+```
+
+You need these two files in the project:
+
+```
+checkpoints/gpt_bpe_best.pt
+tokenizer/bpe.json
+```
 
 ## Model details
 
@@ -127,6 +222,21 @@ IDs   →  lookup bytes per ID  →  UTF-8 decode   →  text
 - `bpe.json` — merge rules (required for encode/decode)
 - `corpus_tokens.pt` — pre-encoded integer sequence for fast training startup
 
+## Checkpoints
+
+| File | Purpose |
+|------|---------|
+| `checkpoints/gpt_bpe.pt` | Latest snapshot (every 500 steps) |
+| `checkpoints/gpt_bpe_best.pt` | Best validation loss — **use this for generation** |
+| `checkpoints/gpt_bpe_final.pt` | Weights from the final step |
+| `checkpoints/model_bundle.zip` | Portable download: best weights + `bpe.json` |
+
+Export the bundle manually anytime:
+
+```powershell
+python export_bundle.py
+```
+
 ## Learning progression
 
 ```
@@ -145,10 +255,12 @@ bigram.py          gpt_bpe.py
 These are created locally and not committed:
 
 - `data/input.txt`
+- `data/instruct.txt`
 - `tokenizer/bpe.json`
 - `tokenizer/corpus_tokens.pt`
+- `checkpoints/`
 - `gpt_venv/`
 
 ## Resume bullet
 
-> Built a byte-level BPE tokenizer and ~10M-parameter GPT from scratch in PyTorch; trained on medical flashcard corpus with causal self-attention, checkpointed token cache, and subword-level generation.
+> Built a byte-level BPE tokenizer and ~10M-parameter GPT from scratch in PyTorch; trained on medical flashcard corpus with causal self-attention, GPU-ready RunPod pipeline, checkpointed weights, and subword-level generation.

@@ -10,4 +10,4 @@ data/instruct.txt
 tokenizer/bpe.json
 tokenizer/corpus_tokens.pt
 checkpoints/
-checkpoints/model_bundle.zip
+checkpoints/gpt_bpe_best.pt
