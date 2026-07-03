@@ -57,8 +57,8 @@ def main() -> None:
     parser.add_argument(
         "--format",
         choices=("pretrain", "instruct"),
-        default="instruct",
-        help="pretrain: answer-only text for LM. instruct: Q&A pairs for question answering.",
+        default="pretrain",
+        help="pretrain: answer-only text for LM (used by gpt_bpe.py). instruct: Q&A pairs for future QA tuning.",
     )
     parser.add_argument(
         "--max-examples",

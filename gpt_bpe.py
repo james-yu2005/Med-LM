@@ -15,7 +15,6 @@ block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
 learning_rate = 3e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
 n_head = 6
@@ -25,8 +24,22 @@ dropout = 0.2
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
 DEFAULT_CHECKPOINT = CHECKPOINT_DIR / "gpt_bpe.pt"
+BEST_CHECKPOINT = CHECKPOINT_DIR / "gpt_bpe_best.pt"
+FINAL_CHECKPOINT = CHECKPOINT_DIR / "gpt_bpe_final.pt"
+
+def get_device() -> str:
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        return "cuda"
+    print("CUDA not available - training on CPU (slow). Use a RunPod PyTorch template for GPU.")
+    return "cpu"
+
+device = get_device()
 
 torch.manual_seed(1337)
+if device == "cuda":
+    torch.cuda.manual_seed_all(1337)
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=block_size, base=10000):
@@ -186,21 +199,20 @@ def save_checkpoint(
     path: Path,
     step: int,
     model: GPTLanguageModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     vocab_size: int,
     losses: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "config": model_config(vocab_size),
-            "losses": losses,
-        },
-        path,
-    )
+    payload = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "config": model_config(vocab_size),
+        "losses": losses,
+    }
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+    torch.save(payload, path)
     print(f"Saved checkpoint: {path}")
 
 def load_checkpoint(
@@ -241,7 +253,8 @@ def train(
     checkpoint_path: Path,
     vocab_size: int,
     resume: bool = False,
-) -> None:
+) -> Path:
+    """Train the model. Returns path to the best checkpoint (lowest val loss)."""
     def get_batch(split):
         data = train_data if split == 'train' else val_data
         ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -255,20 +268,23 @@ def train(
         out = {}
         model.eval()
         for split in ['train', 'val']:
-            losses = torch.zeros(eval_iters)
+            losses = torch.zeros(eval_iters, device=device)
             for k in range(eval_iters):
                 X, Y = get_batch(split)
                 logits, loss = model(X, Y)
                 losses[k] = loss.item()
-            out[split] = losses.mean()
+            out[split] = losses.mean().item()
         model.train()
         return out
 
     start_step = 0
-    if resume:
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"No checkpoint to resume: {checkpoint_path}")
+    best_val = float("inf")
+    best_path = checkpoint_path
+
+    if resume and checkpoint_path.exists():
         start_step = load_checkpoint(checkpoint_path, model, vocab_size, optimizer) + 1
+        if BEST_CHECKPOINT.exists():
+            best_path = BEST_CHECKPOINT
 
     for step in range(start_step, max_iters):
 
@@ -277,6 +293,11 @@ def train(
             losses = estimate_loss()
             print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             save_checkpoint(checkpoint_path, step, model, optimizer, vocab_size, losses)
+            if losses["val"] < best_val:
+                best_val = losses["val"]
+                save_checkpoint(BEST_CHECKPOINT, step, model, optimizer, vocab_size, losses)
+                best_path = BEST_CHECKPOINT
+                print(f"  new best val loss {best_val:.4f} -> {BEST_CHECKPOINT}")
 
         # sample a batch of data
         xb, yb = get_batch('train')
@@ -286,6 +307,10 @@ def train(
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+
+    save_checkpoint(FINAL_CHECKPOINT, max_iters - 1, model, optimizer, vocab_size, losses)
+    print(f"Training complete. Best weights: {best_path}")
+    return best_path
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train or run a byte-level BPE GPT.")
@@ -302,8 +327,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_CHECKPOINT,
-        help=f"Checkpoint path (default: {DEFAULT_CHECKPOINT}).",
+        default=None,
+        help="Checkpoint path (default: checkpoints/gpt_bpe_best.pt if present, else gpt_bpe.pt).",
     )
     parser.add_argument(
         "--prompt",
@@ -317,6 +342,14 @@ def main() -> None:
         help="Tokens to generate with --generate.",
     )
     args = parser.parse_args()
+
+    if args.checkpoint is None:
+        if args.generate and BEST_CHECKPOINT.exists():
+            args.checkpoint = BEST_CHECKPOINT
+        elif args.generate and FINAL_CHECKPOINT.exists():
+            args.checkpoint = FINAL_CHECKPOINT
+        else:
+            args.checkpoint = DEFAULT_CHECKPOINT
 
     tokenizer = load_tokenizer()
     vocab_size = tokenizer.vocab_size
@@ -345,8 +378,22 @@ def main() -> None:
     val_data = data[n:]
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    train(model, optimizer, train_data, val_data, args.checkpoint, vocab_size, resume=args.resume)
+    if args.resume and not args.checkpoint.exists():
+        raise FileNotFoundError(f"No checkpoint to resume: {args.checkpoint}")
+
+    best_path = train(model, optimizer, train_data, val_data, args.checkpoint, vocab_size, resume=args.resume)
+
+    from export_bundle import export_bundle
+    from tokenizer.corpus import TOKENIZER_PATH
+
+    bundle_path = CHECKPOINT_DIR / "model_bundle.zip"
+    export_bundle(best_path, TOKENIZER_PATH, bundle_path)
+
+    load_checkpoint(best_path, model, vocab_size)
+    model.eval()
+    print("\nSample generation:")
     print(generate_sample(model, encode, decode))
+    print(f"\nTo test later (local or new pod):\n  python gpt_bpe.py --generate --checkpoint {best_path}")
 
 
 if __name__ == "__main__":

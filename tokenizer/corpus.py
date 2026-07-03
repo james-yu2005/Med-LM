@@ -19,7 +19,7 @@ CORPUS_MAX_CHARS = 4_000_000
 def read_corpus(max_chars: int | None = None) -> str:
     if not CORPUS_PATH.exists():
         raise FileNotFoundError(
-            f"Corpus not found: {CORPUS_PATH}. Run: python data/load_dataset.py"
+            f"Corpus not found: {CORPUS_PATH}. Run: python data/load_dataset.py --format pretrain"
         )
     text = CORPUS_PATH.read_text(encoding="utf-8")
     return text[:max_chars] if max_chars is not None else text
