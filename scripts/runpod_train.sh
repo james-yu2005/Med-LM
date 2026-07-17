@@ -19,7 +19,13 @@ python -m tokenizer.train
 echo "=== Train GPT ==="
 python gpt_bpe.py "$@"
 
-echo "=== Export bundle for download ==="
-python export_bundle.py
+echo "=== Export bundle for download (best checkpoint) ==="
+# gpt_bpe.py already exports best_path; re-export explicitly so a best-model
+# bundle is never overwritten by the latest snapshot (gpt_bpe.pt).
+if [[ -f checkpoints/gpt_bpe_best.pt ]]; then
+  python export_bundle.py --checkpoint checkpoints/gpt_bpe_best.pt
+else
+  python export_bundle.py
+fi
 
 echo "Done. Download checkpoints/model_bundle.zip before stopping the pod."

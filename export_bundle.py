@@ -4,10 +4,17 @@ import argparse
 import zipfile
 from pathlib import Path
 
-from gpt_bpe import DEFAULT_CHECKPOINT
+from gpt_bpe import BEST_CHECKPOINT, DEFAULT_CHECKPOINT
 from tokenizer.corpus import TOKENIZER_PATH
 
 BUNDLE_PATH = Path(__file__).resolve().parent / "checkpoints" / "model_bundle.zip"
+
+
+def resolve_default_checkpoint() -> Path:
+    """Prefer the best-val checkpoint so bundles stay generation-ready."""
+    if BEST_CHECKPOINT.exists():
+        return BEST_CHECKPOINT
+    return DEFAULT_CHECKPOINT
 
 
 def export_bundle(
@@ -38,8 +45,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_CHECKPOINT,
-        help="Checkpoint file to include.",
+        default=None,
+        help="Checkpoint file to include (default: gpt_bpe_best.pt if present, else gpt_bpe.pt).",
     )
     parser.add_argument(
         "--tokenizer",
@@ -54,7 +61,8 @@ def main() -> None:
         help="Output zip path.",
     )
     args = parser.parse_args()
-    export_bundle(args.checkpoint, args.tokenizer, args.output)
+    checkpoint = args.checkpoint if args.checkpoint is not None else resolve_default_checkpoint()
+    export_bundle(checkpoint, args.tokenizer, args.output)
 
 
 if __name__ == "__main__":

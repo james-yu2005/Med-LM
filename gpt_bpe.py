@@ -47,7 +47,8 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len).float()
         freqs = torch.outer(t, inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
+        # Interleave so each adjacent (even, odd) pair shares one frequency.
+        emb = torch.stack((freqs, freqs), dim=-1).flatten(-2)
         self.register_buffer("cos", emb.cos())
         self.register_buffer("sin", emb.sin())
 
@@ -202,6 +203,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer | None,
     vocab_size: int,
     losses: dict | None = None,
+    best_val_loss: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -209,18 +211,33 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "config": model_config(vocab_size),
         "losses": losses,
+        "best_val_loss": best_val_loss,
     }
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     torch.save(payload, path)
     print(f"Saved checkpoint: {path}")
 
+def read_checkpoint_meta(path: Path) -> dict:
+    """Load checkpoint metadata without applying weights."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    best_val_loss = checkpoint.get("best_val_loss")
+    losses = checkpoint.get("losses")
+    if best_val_loss is None and isinstance(losses, dict):
+        best_val_loss = losses.get("val")
+    return {
+        "step": checkpoint.get("step", checkpoint.get("iter", 0)),
+        "best_val_loss": best_val_loss,
+        "losses": losses,
+        "config": checkpoint.get("config", {}),
+    }
+
 def load_checkpoint(
     path: Path,
     model: GPTLanguageModel,
     vocab_size: int,
     optimizer: torch.optim.Optimizer | None = None,
-) -> int:
+) -> tuple[int, float | None]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     saved_config = checkpoint.get("config", {})
     for key, value in model_config(vocab_size).items():
@@ -230,8 +247,9 @@ def load_checkpoint(
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     step = checkpoint.get("step", checkpoint.get("iter", 0))
+    best_val_loss = checkpoint.get("best_val_loss")
     print(f"Loaded checkpoint from step {step}: {path}")
-    return step
+    return step, best_val_loss
 
 def generate_sample(
     model: GPTLanguageModel,
@@ -280,11 +298,25 @@ def train(
     start_step = 0
     best_val = float("inf")
     best_path = checkpoint_path
+    losses = None
 
     if resume and checkpoint_path.exists():
-        start_step = load_checkpoint(checkpoint_path, model, vocab_size, optimizer) + 1
+        start_step, restored_best = load_checkpoint(checkpoint_path, model, vocab_size, optimizer)
+        start_step += 1
+        if restored_best is not None:
+            best_val = restored_best
         if BEST_CHECKPOINT.exists():
             best_path = BEST_CHECKPOINT
+            meta_best = read_checkpoint_meta(BEST_CHECKPOINT).get("best_val_loss")
+            if meta_best is not None:
+                best_val = meta_best
+
+    if start_step >= max_iters:
+        print(
+            f"Checkpoint already finished training "
+            f"(next step {start_step} >= max_iters {max_iters}). Skipping train loop."
+        )
+        return best_path if BEST_CHECKPOINT.exists() else checkpoint_path
 
     for step in range(start_step, max_iters):
 
@@ -292,12 +324,16 @@ def train(
         if step % eval_interval == 0 or step == max_iters - 1:
             losses = estimate_loss()
             print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            save_checkpoint(checkpoint_path, step, model, optimizer, vocab_size, losses)
             if losses["val"] < best_val:
                 best_val = losses["val"]
-                save_checkpoint(BEST_CHECKPOINT, step, model, optimizer, vocab_size, losses)
+                save_checkpoint(
+                    BEST_CHECKPOINT, step, model, optimizer, vocab_size, losses, best_val
+                )
                 best_path = BEST_CHECKPOINT
                 print(f"  new best val loss {best_val:.4f} -> {BEST_CHECKPOINT}")
+            save_checkpoint(
+                checkpoint_path, step, model, optimizer, vocab_size, losses, best_val
+            )
 
         # sample a batch of data
         xb, yb = get_batch('train')
@@ -308,7 +344,9 @@ def train(
         loss.backward()
         optimizer.step()
 
-    save_checkpoint(FINAL_CHECKPOINT, max_iters - 1, model, optimizer, vocab_size, losses)
+    save_checkpoint(
+        FINAL_CHECKPOINT, max_iters - 1, model, optimizer, vocab_size, losses, best_val
+    )
     print(f"Training complete. Best weights: {best_path}")
     return best_path
 
