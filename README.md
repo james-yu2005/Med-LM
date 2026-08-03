@@ -260,7 +260,3 @@ These are created locally and not committed:
 - `tokenizer/corpus_tokens.pt`
 - `checkpoints/`
 - `gpt_venv/`
-
-## Resume bullet
-
-> Built a byte-level BPE tokenizer and ~10M-parameter GPT from scratch in PyTorch; trained on medical flashcard corpus with causal self-attention, GPU-ready RunPod pipeline, checkpointed weights, and subword-level generation.
